@@ -1,0 +1,770 @@
+# coding=utf-8
+import datetime
+from scrapy import Request
+from scrapy import Selector
+from bs4 import BeautifulSoup
+
+import base64
+import os
+import re
+import sys
+
+from biddingeye_1_0_0.utils.KeyWordSearch import KeyWordSearch
+from biddingeye_1_0_0.classify.classify_filter import ClassifyMan
+
+reload(sys)
+sys.setdefaultencoding('utf-8')
+
+from biddingeye_1_0_0.utils.htmlparse import PyEventParser
+from biddingeye_1_0_0.utils.log import blog
+
+
+sys.path.insert(0,'..')
+
+import time
+import MySQLdb
+import logging
+from scrapy import Spider
+
+g_max_idx = 0  # 本轮采集的最大值
+
+bid_home = os.getcwd()
+log_name = os.path.join(bid_home+"/output",
+               "bee" + "-" + "scrapy" + "-" + time.strftime("%Y%m%d%H%M%S",time.localtime()) + ".log")
+logger = blog("d", log_name, logging.INFO).getLog()
+
+
+name_buyer = "采购人"
+name_agent = "采购代理"
+name_papertm = "标书购买截止时间"
+name_betm = "投标截止时间"
+
+name_budget = "项目预算"
+name_ntype = "公告类型"
+name_keylist = "关键字列表"
+name_aptitude = "资质要求"
+name_actualize = "实施内容"
+name_stitle = "包标题"
+
+
+_buyer = re.compile("(?<=(采购人为))[^-~]+?公司(?=[，。])")
+_agent = re.compile("(?<=(采购代理机构为))([^-~]+公司(?=[，。]))+?")
+
+_tm = re.compile("(\d{2,4}年[^-~]+\d+分)+?")
+_betm = re.compile("(纸质应答[^-~]+\d+分)+?")
+
+_tm2 = re.compile("((?<=至)\d{2,4}年[^-~]+\d+分)+?")
+_papertm = re.compile("(文件售卖[^-~]+\d+分)+?")
+
+
+_budgetcheck = re.compile("(预算|金额|不含税)")
+_budget = re.compile("([1-9]\d*万元.*税.{3})")
+_ntype = re.compile("")
+
+_aptitudestart = re.compile(".*[二、].*资格要求")
+_aptitudeend = re.compile("^三、.*")
+
+_actualize_tablestart = re.compile("表格X:.*")
+_actualize_tablehead = re.compile("包段 产品名称")
+_actualize_title = re.compile("包[0-9]{0,3} (.+?) ")
+_stitle = re.compile("")
+
+
+class BiddingEye(Spider):
+        name = 'BiddingEye'
+
+        def __init__(self):  # 示例：bid = 12339
+                super(BiddingEye, self).__init__()
+
+                #print log_name
+
+                self.log = blog("d", "bindding.log", 10).getLog()
+
+                #self.bid = bid  # 参数bid由此传入
+                self.start2_urls = ['https://b2b.10086.cn/b2b/main/listVendorNoticeResult.html?noticeBean.noticeType=2&page.currentPage=0&page.perPageSize=20&noticeBean.sourceCH=&noticeBean.source=&noticeBean.title=&noticeBean.startDate=&noticeBean.endDate=',
+                                   'https://b2b.10086.cn/b2b/main/listVendorNoticeResult.html?noticeBean.noticeType=7&page.currentPage=0&page.perPageSize=20&noticeBean.sourceCH=&noticeBean.source=&noticeBean.title=&noticeBean.startDate=&noticeBean.endDate=']
+
+                self.start_urls = [
+                    'https://b2b.10086.cn/b2b/main/listVendorNoticeResult.html?noticeBean.noticeType=2&page.currentPage=0&page.perPageSize=20&noticeBean.sourceCH=&noticeBean.source=&noticeBean.title=&noticeBean.startDate=&noticeBean.endDate=']
+
+                self.instan_urls = "https://b2b.10086.cn/b2b/main/viewNoticeContent.html?noticeBean.id="
+                self.allowed_domain = 'b2b.10086.cn'
+                self.firstpage = [u"采购需求单位", u"公告类型", u"公告标题", u"公告时间"]
+                self._last_idx = 0 # last采集的最大值
+                self._max_idx = 0 #本轮采集的最大值
+                self._min_idx = 0 # 本轮采集的最小值
+                self._cur_idx = 0 #curr采集的最大值
+
+                self._page_max_n = 0
+                self._cur_page_n = 0
+                self._set_max_page = 0
+
+                self._exit_num = 0
+                logger.info("Parse biddingeye init .....!")
+                #print os.getcwd()
+                self.load_ctl_file()
+                self._max_idx = self._last_idx #max_idx 初始值
+                g_max_idx = self._last_idx
+
+
+        # def initDBData(self):
+        #     try:
+        #         print self._db_dict['host'] + "|" + str(self._db_dict['port']) + "|" +  self._db_dict['user'] + \
+        #         "|" + self._db_dict['passwd'] + "|" + self._db_dict['database'] + "|" + self._db_dict['charset']
+        #
+        #         conn = MySQLdb.connect(host=self._db_dict["host"], port=self._db_dict["port"], user=self._db_dict["user"],
+        #                                passwd=self._db_dict["passwd"], db=self._db_dict["database"], charset=self._db_dict["charset"])
+        #
+        #     except MySQLdb.Error, e:
+        #         try:
+        #             sqlError = "Error %d:%s" % (e.args[0], e.args[1])
+        #             print sqlError
+        #         except IndexError:
+        #             print "MySQL Error:%s" % str(e)
+        #         return
+        #
+        #     self._db_cursor = conn.cursor()
+
+        def parse(self, response):
+            """对网站页面进行循环处理"""
+            addr_start_idx_1 = "2"
+            addr_start_idx_2 = "7"
+            utype = 0
+            #判断网站当前是否可用
+
+            request_type = re.findall(r'noticeBean.noticeType=(.)', response.url, re.S | re.M).pop()
+            if request_type != '2' and request_type != '7':
+                self.log.error("request_type value is error: [" + request_type + "]")
+
+            elif request_type == '2':
+                utype = 2
+            elif request_type == '7':
+                utype = 7
+
+            page_addr_head = 'https://b2b.10086.cn/b2b/main/listVendorNoticeResult.html' + '?noticeBean.noticeType=' + request_type + '&page.currentPage='
+
+            page_addr_tail = """&page.perPageSize=20&noticeBean.sourceCH=&noticeBean.source=""" \
+                            + """&noticeBean.title=&noticeBean.startDate=&noticeBean.endDate="""
+            #提取页面总数
+            sel = Selector(response)
+            urls_list = sel.xpath("//td[@id='pageid2']/table/tbody/tr/td/a/@onclick").extract()
+            if self._set_max_page == 0 and urls_list[6]:
+                page_max_n = re.findall(r'gotoPage\((.*?)\)', urls_list[6], re.S | re.M).pop()
+                self._set_max_page = 1
+                self._page_max_n = page_max_n
+                self.log.debug("设置网站网页总数:" + page_max_n)
+
+            #while self._cur_page_n <= 5:
+            self._cur_page_n = self._cur_page_n + 1
+            #横向解析: 页面数据推入队列
+
+            #筛选公告页面 or 结果公示页面
+
+
+            page_addr_url = page_addr_head + str(self._cur_page_n) + page_addr_tail
+
+
+
+            yield Request(page_addr_url)
+
+            if self._cur_page_n == 3:
+                    return
+
+            # 纵向解析: 页面数据推入队列
+            sel = Selector(response)
+            urls_list = sel.xpath("//tr[@class and @onmousemove]").extract()
+            for url in urls_list:
+                #print len(url), url
+                # 提取该链接的实体编号
+                res_tr = r'onclick=\"selectResult\(\'(.*?)\'\)\">'
+                m_tr = re.findall(res_tr, url, re.S | re.M)
+                instanceNum = m_tr.pop()
+                #print instanceNum
+
+                # 获取表格第二列td 属性值
+                res_td = r'<td.*?>(.*?)</td>'
+                m_td = re.findall(res_td, url, re.S | re.M)
+                i = 0
+                content_title = ""
+                content_type = ""
+                content_comp = ""
+                content_time = ""
+                for nn in m_td:
+                    res_href = r'<a href=\".*?\">(.*?)</a>'
+                    res_m = re.findall(res_href, nn, re.S | re.M)
+                    if res_m:
+                        content_title = res_m.pop()
+                    else:
+                        # print self.firstpage[i] + ":" + nn
+                        if i == 0:
+                            content_type = nn
+                        elif i == 1:
+                            content_comp = nn
+                        elif i == 3:
+                            content_time = nn
+
+                    i = i + 1
+
+                content_url = self.instan_urls + instanceNum
+
+                # verity num idx
+                self._cur_idx = int(instanceNum)
+                if self._cur_idx <= self._last_idx:
+                    self.log.debug( "current idx :" + str(self._cur_idx) + "  max:" + str(self._last_idx))
+                    self._exit_num = self._exit_num + 1
+                    if self._exit_num >= 3:
+		    	pid = os.getpid()
+			cmd = 'kill -9 ' + str(pid)
+			print "cmd:"+cmd
+			os.system(cmd)
+                    return
+                else:
+                    if self._cur_idx > self._max_idx:
+                        self.log.debug("update max idx ........." + str(instanceNum)+"url:"+content_url)
+                        self._max_idx = self._cur_idx
+                        g_max_idx = self._max_idx
+                        self.log.debug( "fetch content ........." + str(instanceNum))
+                        #self._last_idx = self._max_idx
+                        self.update_ctl_file()
+
+                    yield Request(content_url, callback=self.parse_content, meta={'ctype': content_type,
+                                                                              'ctitle': content_title,
+                                                                              'ctime': content_time,
+                                                                              'ccomp': content_comp,
+                                                                              'link':content_url,
+                                                                              'utype': utype,
+                                                                              'num': instanceNum})
+
+
+            self.log.debug ("本页采集结束!处理当前[%u]页!本次采集任务预更新至 %u " % (self._cur_page_n, self._max_idx))
+
+
+
+
+        def parse2(self, response):
+            """对网站页面进行循环处理"""
+            #判断网站当前是否可用
+
+            #提取页面总数
+            sel = Selector(response)
+
+            urls_list = sel.xpath("//td[@id='pageid2']/table/tbody/tr/td/a/@onclick").extract()
+
+            if urls_list[6]:
+                page_max_n = re.findall(r'gotoPage\((.*?)\)', urls_list[6], re.S | re.M).pop()
+                self.log.debug( "网站网页总数:"+page_max_n)
+
+            #提取各个页面相关数据信息
+            page_n = 0
+            while page_n <= page_max_n:
+                    page_addr_url = """https://b2b.10086.cn/b2b/main/listVendorNoticeResult.html"""\
+                                    + """?noticeBean.noticeType=2&page.currentPage=""" \
+                                    + str(page_n) \
+                                    + """&page.perPageSize=20&noticeBean.sourceCH=&noticeBean.source=""" \
+                                    + """&noticeBean.title=&noticeBean.startDate=&noticeBean.endDate="""
+
+                    self.log.debug( page_addr_url)
+
+
+                    yield Request(page_addr_url, callback = self.parsePage, encoding='utf-8', priority=0)
+                    page_n = page_n + 1
+
+                    self.log.debug( "max idx [" + str(self._last_idx) + "] cur idx [" + str(self._last_idx) + "]")
+                    #本子伤不起，先玩5页在研究
+                    # if self._last_idx > 0 and self._cur_idx < self._max_idx:
+                    #     print "over this collect ..... !"
+                    #     break
+
+                    if page_n == 5:
+                        break
+
+            #更新本轮抓取的最大公告索引值；
+            self._last_idx = self._max_idx
+            self.update_ctl_file()
+
+            self.log.debug ("本次采集结束!共处理 %u 页!本次采集任务预更新至 %u "%(page_n,  self._max_idx))
+
+
+        def parsePage(self, response):
+                """对投标列表进行提取分析"""
+                #print response.body
+                self.log.debug( "解析页面数据........")
+                sel = Selector(response)
+                urls_list = sel.xpath("//tr[@class and @onmousemove]").extract()
+                # print len(urls_list), urls_list
+                for url in urls_list:
+                    self.log.debug( len(url), url)
+
+                    #提取该链接的实体编号
+                    res_tr = r'onclick=\"selectResult\(\'(.*?)\'\)\">'
+                    m_tr = re.findall(res_tr, url, re.S | re.M)
+                    instanceNum = m_tr.pop()
+                    #print instanceNum
+
+                    # 获取表格第二列td 属性值
+                    res_td = r'<td.*?>(.*?)</td>'
+                    m_td = re.findall(res_td, url, re.S|re.M)
+                    i = 0
+                    content_title = ""
+                    content_type = ""
+                    content_comp = ""
+                    content_time = ""
+                    for nn in m_td:
+                        res_href = r'<a href=\".*?\">(.*?)</a>'
+                        res_m = re.findall(res_href, nn, re.S|re.M)
+                        if res_m:
+                            content_title = res_m.pop()
+                        else:
+                            #print self.firstpage[i] + ":" + nn
+                            if i == 0:
+                                content_compe = nn
+                            elif i == 1:
+                                content_type = nn
+                            elif i == 3:
+                                content_time = nn
+
+                        i = i + 1
+
+                    content_url = self.instan_urls + instanceNum
+
+                    #verity num idx
+                    self._cur_idx = int(instanceNum)
+                    if self._cur_idx <= self._last_idx:
+                        self.log.debug( "current idx :" + str(self._cur_idx)+"  max:"+ str(self._max_idx))
+
+                    else:
+                        if self._cur_idx > self._max_idx:
+                            self.log.debug( "update max idx ........." + str(instanceNum))
+                            self._max_idx = self._cur_idx
+                            g_max_idx = self._max_idx
+                            self.log.debug( "fetch content ........." + str(instanceNum))
+                    #print "content:" + content_url
+                    yield Request(content_url, callback=self.parse_content, meta={'ctype':content_type,
+                                                                                  'ctitle':content_title,
+                                                                                  'ctime':content_time,
+                                                                                  'ccomp':content_comp,
+                                                                                  'num': instanceNum,
+                                                                                  'link':content_url})
+
+                    self.log.debug( "=========================")
+
+
+
+        def parse_content(self, response):
+                """对投标详页进行解析提取"""
+                self.log.debug( "###############################")
+                #print response.body
+                sel = Selector(response)
+                cont_table = sel.xpath("//table[@class=\"zb_table\"]").extract()
+                cont_title = sel.xpath("//h1/text()").extract().pop()
+                content =  cont_table.pop()
+                soup = BeautifulSoup(content)
+                text = ""
+                name_buyer = ""
+                name_agent = ""
+                name_papertm = ""
+                name_betm =""
+                name_budget = ""
+                name_aptitude = ""
+                name_actualize = ""
+                name_stitle = []
+                i = 0
+
+                for text_temp in soup.stripped_strings:
+                     text = text + text_temp
+
+                self.log.debug( u"公告编号：" + response.meta['num'] + "\n")
+                self.log.debug (u"采购单位: " + response.meta['ctype'])
+                self.log.debug( u"公告类型: " + response.meta['ccomp'])
+                self.log.debug( u"公告标题: " + response.meta['ctitle'])
+
+                self.log.debug( u"公告时间: " + response.meta['ctime'])
+                self.log.debug( u"公告连接: " + response.meta['link'])
+                self.log.debug( u"标题详细: " + cont_title)
+                self.log.debug( u"公告内容: " + "#####")
+
+                dirname_temp = ""
+                dirname, dirname1, dirname2 = response.meta['ctime'].split('-')
+                if response.meta['utype'] == 7:
+                    dirname = "RESULT/" + dirname
+                else:
+                    dirname = "NOTICE/" + dirname
+
+
+                if dirname and  dirname1 and dirname2:
+                    if not os.path.exists(dirname):
+                        os.makedirs(dirname)
+
+                    dirname_temp = dirname + "/" + dirname1
+                    if not os.path.exists(dirname_temp):
+                        os.makedirs(dirname_temp)
+
+                    dirname_temp = dirname_temp + "/" + dirname2
+                    if not os.path.exists(dirname_temp):
+                        os.makedirs(dirname_temp)
+                else:
+                    self.log.debug( "目录解析失败...")
+                    return
+                if response.meta['utype'] == 2:
+                    file_name = dirname_temp + "/" + response.meta['num'] + ".txt"
+                elif response.meta['utype'] == 7:
+                    file_name = dirname_temp + "/" + response.meta['num'] + "_r.txt"
+                else:
+                    return
+                #print file_name
+                #print u"公告存储: " + file_name
+                #  f = codecs.open(file_name, 'w', 'utf-8')
+                #文件数据备份
+                f = open(file_name, 'wb')
+                f.write((response.meta['ctype']+'\n').decode('utf8'))
+                f.write((response.meta['ccomp']+'\n').decode('utf8'))
+                f.write((cont_title +'\n').decode('utf8'))
+                f.write((response.meta['ctime']+'\n').decode('utf8'))
+                f.write((response.meta['link']+'\n').decode('utf8'))
+                parser = PyEventParser()
+                parser.feed(content)
+                txt_content = parser.get_result()
+                f.write(txt_content)
+                f.close()
+
+
+                #提取标题关键字
+                cont_title_tmp = cont_title.split('_')
+                title_key = cont_title_tmp[0]
+
+                #同步数据若操作
+                conn = None
+                cursor = None
+
+                if len(title_key) > 0:
+                    try:
+                        self.log.debug( "开始写入数据库:")
+                        conn = MySQLdb.connect(host='10.10.126.127', port=3306, user='Bee', passwd='Bee#123456', db='bee',
+                                               charset='utf8')
+                        cursor = conn.cursor()
+                        dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        if response.meta['utype'] == 2:
+                            #结果公告
+                            notify_value_tuple = (response.meta['num'],
+                                          response.meta['ctype'],
+                                          title_key,
+                                          response.meta['ctime'],
+                                          response.meta['link'],
+                                          MySQLdb.escape_string(content),
+                                          dt,
+                                          base64.b64encode(title_key))
+                            self.write_ori_notice_db(cursor, notify_value_tuple)
+
+                            # 解析关键字段
+                            key_content = open(file_name).readlines(1000)
+                            analy = KeyWordSearch(key_content)
+                            key_dict = analy.fetchHandle()
+                            print "key_dict:" + str(key_dict)
+                            # key_dict = self.fetchHandle(txt_content)
+
+                            if key_dict:
+                                name_buyer = key_dict.get("name_buyer")
+                                name_agent = key_dict.get("name_agent")
+                                name_papertm = key_dict.get("name_papertm")
+                                name_betm = key_dict.get("name_betm")
+                                name_budget = key_dict.get("name_budget")
+                                name_aptitude = key_dict.get("name_aptitude")
+                                name_actualize = key_dict.get("name_actualize")
+                                name_stitle = key_dict.get("name_stitle")
+
+                            if len(name_stitle) <= 0:
+                                notify_value_tuple = (response.meta['num'],
+                                                      response.meta['ctype'],
+                                                      title_key,
+                                                      response.meta['ctime'],
+                                                      response.meta['link'],
+                                                      response.meta['ccomp'],
+                                                      name_papertm,
+                                                      name_betm,
+                                                      name_buyer,
+                                                      name_agent,
+                                                      name_budget,
+                                                      name_aptitude,
+                                                      0,
+                                                      "",
+                                                      dt)
+                                self.write_analysis_notice_db(cursor, notify_value_tuple)
+                            else:
+                                for title in name_stitle:
+                                    notify_value_tuple = (response.meta['num'],
+                                                          response.meta['ctype'],
+                                                          title_key,
+                                                          response.meta['ctime'],
+                                                          response.meta['link'],
+                                                          response.meta['ccomp'],
+                                                          name_papertm,
+                                                          name_betm,
+                                                          name_buyer,
+                                                          name_agent,
+                                                          name_budget,
+                                                          name_aptitude,
+                                                          i,
+                                                          title,
+                                                          dt)
+                                    i = i + 1
+
+                                self.write_analysis_notice_db(cursor, notify_value_tuple)
+
+                        elif response.meta['utype'] == 7:
+                            result_value_tuple = (response.meta['num'],
+                                          response.meta['ctime'],
+                                          response.meta['link'],
+                                          MySQLdb.escape_string(content),
+                                          dt,
+                                          base64.b64encode(title_key))
+                            self.update_ori_notice_db(cursor, result_value_tuple)
+
+                            result_value_tuple = (response.meta['num'],
+                                                  response.meta['ctype'],
+                                                  response.meta['ctime'],
+                                                  title_key,
+                                                  response.meta['link'],
+                                                  dt)
+                            self.write_analysis_result_db(cursor, result_value_tuple)
+                        else:
+                            self.log.debug( "this data type" + response.meta['utype']+" is not supported!!")
+
+                    except MySQLdb.Error, e:
+                        try:
+                            sqlError = "Error %d:%s" % (e.args[0], e.args[1])
+                            self.log.error( sqlError)
+                        except IndexError:
+                            self.log.error( "MySQL Error:%s" % str(e))
+                    finally:
+                        if conn != None:
+                            if cursor != None:
+                                cursor.close()
+                            conn.commit()
+                            conn.close()
+
+
+
+
+        def write_file(self, filename, content):
+                pass
+
+        def update_ori_notice_db(self, cursor, result_value_tuple):
+                sql = "update BID_RAW_NOTICE_DATA_T set rid='%s', result_date='%s', result_url='%s', result_content='%s', " \
+                      "result_time='%s' where title_key='%s'" % result_value_tuple
+                self.log.debug( "RAW DB UPDATE:"+ sql)
+                cursor.execute(sql)
+
+        def write_ori_notice_db(self, cursor, notify_value_tuple):
+                sql = "insert into BID_RAW_NOTICE_DATA_T (nid, prov_name, notice_title, notice_date, notice_url, " \
+                      "notice_content, notice_time, title_key) values('%s','%s','%s','%s','%s','%s','%s', '%s') " % notify_value_tuple
+                #self.log.debug( "DB INSERT:"+ sql)
+                cursor.execute(sql)
+
+
+        def write_analysis_notice_db(self, cursor, notify_value_tuple):
+                sql = "insert into BID_PURCHASE_NOTICE_DATA_T (id, prov, title, date, url, type, " \
+                      " apply_tm, bid_tm, purchaser, agency, budget, qualifications, sub_title, sid, db_time )" \
+                      "values('%s','%s','%s','%s','%s', '%s', '%s','%s','%s','%s','%s', '%s', '%s','%s','%s') " % notify_value_tuple
+                #self.log.debug( "DB ANALYSIS INSERT:"+ sql)
+                cursor.execute(sql)
+                sql2 = "insert into BID_PURCHASE_NOTICE_MODIFY_DATA_T (id, prov, title, date, url, type, " \
+                       "apply_tm, bid_tm, purchaser, agency, budget, qualifications,  sub_title,  sid, db_time )" \
+                      "values('%s','%s','%s','%s','%s', '%s', '%s','%s','%s','%s','%s', '%s', '%s','%s', '%s') " % notify_value_tuple
+                #self.log.debug("DB ANALYSIS INSERT:" + sql2)
+                cursor.execute(sql2)
+
+        def write_analysis_result_db(self, cursor, notify_value_tuple):
+                sql = "insert into BID_PURCHASE_RESULT_DATA_T (id, prov, date, title, url, db_time )" \
+                      "values('%s','%s','%s','%s','%s', '%s') " % notify_value_tuple
+                self.log.debug( "RESULT DB INSERT:"+ sql)
+                cursor.execute(sql)
+
+                sql2 = "insert into BID_PURCHASE_RESULT_MODIFY_DATA_T (id, prov, date, title, url, db_time )" \
+                      "values('%s','%s','%s','%s','%s', '%s') " % notify_value_tuple
+                #self.log.debug("DB INSERT:" + sql2)
+                cursor.execute(sql2)
+
+
+        def load_ctl_file(self):
+            if not os.path.exists("control"):
+                os.makedirs("control")
+            file_name = "control/setup_idx_control.txt"
+            fd = open(file_name, 'rw+')
+            line = fd.readline()
+
+            if line.__len__() > 0:
+                try:
+                    self._last_idx = int(line)
+                    self.log.debug( "read max idx " + str(self._last_idx))
+                except:
+                    self.log.error("spider setup error, line not a int vule!")
+                    self._last_idx = 0
+                    self.log.debug(str(self._last_idx))
+                    fd.write(str(self._last_idx))
+            else:
+                self._last_idx = 0
+                self.log.debug( str(self._last_idx))
+                fd.write(str(self._last_idx))
+
+            fd.close()
+
+        def update_ctl_file(self):
+            file_name = "control/setup_idx_control.txt"
+            fd = open(file_name, 'w+')
+            if fd is not None and self._max_idx > self._last_idx:
+                self.log.debug( "update max idx :" + str(self._last_idx))
+                fd.write(str(self._max_idx))
+            else:
+                self.log.error( "open file error! not update!")
+
+            fd.close()
+
+        def fetchHandle(self, txt_content):
+            title = ""
+            str_buyer = ""
+            str_agent = ""
+            str_papertm = ""
+            str_betm = ""
+            str_budget = ""
+            str_ntype = ""
+            str_aptitude = ""
+            str_actualize = ""
+            str_stitle_list = []
+            aptitude_flag = 0
+            actualize_flag = 0
+            aptitude_buf = ""
+            ap_end = None
+            ap_start = None
+
+            info_dict = {
+                "name_buyer": "",
+                "name_agent": "",
+                "name_papertm": "",
+                "name_betm": " ",
+                "name_budget": " ",
+                "name_ntype": " ",
+                "name_keylist": " ",
+                "name_aptitude": "",
+                "name_actualize": "",
+                "name_stitle": []
+            }
+
+            # 内容分类
+            # 子内容分类
+            for line in txt_content:
+                print "##:"+line
+                # result=buyer.search("公司2016年行业网关等系统维保技术服务，采购人为中国移动通信集团辽宁有限公司，")
+                if title == "":
+                    title = line
+
+                # 提取采购人
+                r_buyer = _buyer.search(line)
+                if r_buyer:
+                    # print "%-20s\t%s" % (name_buyer, r_buyer.group())
+                    if str_buyer == "":
+                        str_buyer = r_buyer.group()
+
+                # 提取采购代理
+                r_agent = _agent.search(line)
+                if r_agent:
+                    # print "%-20s\t%s" % (name_agent, r_agent.group())
+                    if str_agent == "":
+                        str_agent = r_agent.group()
+
+                # 提取报名时间
+                r_papertm = _papertm.search(line)
+                if r_papertm:
+                    r_papertm2 = _tm2.search(r_papertm.group())
+                    if r_papertm2:
+                        # print "%-20s\t%s" % (name_papertm, r_papertm2.group())
+                        if str_papertm == "":
+                            str_papertm = r_papertm2.group()
+
+                # 提取截止时间
+                r_betm = _betm.search(line)
+                if r_betm:
+                    r_betm2 = _betm.search(r_betm.group())
+                    if r_betm2:
+                        # print "%-22s\t%s" % (name_betm, r_betm2.group())
+                        if str_betm == "":
+                            str_betm = r_betm2.group()  # inputfile = sys.argv[1]
+
+                # 提取项目预算
+                r_budget = _budgetcheck.search(line)
+                if r_budget and str_budget == "":
+                    r_budget = _budget.search(line)
+                    if r_budget:
+                        str_budget = r_budget.group()
+
+                # 提取包类型
+                r_ntype = _ntype.search(line)
+                if r_ntype and str_ntype == "":
+                    str_ntype = r_ntype.group()
+
+                # 提取资质要求
+                if (aptitude_flag != 2):
+                    ap_end = _aptitudeend.search(line)
+                    if aptitude_flag == 1 and ap_end is None:
+                        str_aptitude = str_aptitude + line
+
+                    ap_start = _aptitudestart.search(line)
+                    if ap_start:
+                        # print "资质开始－>"+ ap_start.group()
+                        aptitude_flag = 1
+
+                    if ap_end:
+                        # print "资质结束->" + ap_end.group()
+                        aptitude_flag = 2
+
+                # 提实施内容
+                # r_actualize = self._actualize.search(line)
+                # if r_actualize and str_actualize == "":
+                # 	str_actualize = r_actualize.group()
+
+
+                # 提取包标题
+                if (actualize_flag != 2):
+                    stitle_cont = _actualize_title.search(line)
+                    if actualize_flag == 1 and stitle_cont is not None:
+                        # print "子包标题:－>" + stitle_cont.group(1)
+                        str_stitle_list.append(stitle_cont.group(1))
+
+                    if actualize_flag == 1 and stitle_cont is None:
+                        # print "子包提取结束:－>" + line
+                        actualize_flag = 2
+
+                    stitle_start = _actualize_tablehead.search(line)
+                    if stitle_start:
+                        # print "子包提取开始:－>" + stitle_start.group()
+                        actualize_flag = 1
+
+            # print "%s : %s" % (self._content, title.strip('\n'))
+            print "%-20s\t%s" % (name_buyer, str_buyer)
+            print "%-20s\t%s" % (name_agent, str_agent)
+            print "%-20s\t%s" % (name_papertm, str_papertm)
+            print "%-22s\t%s" % (name_betm, str_betm)
+
+            print "%-20s\t%s" % (name_budget, str_budget)
+            print "%-20s\t%s" % (name_ntype, str_ntype)
+            # print "%-20s\t%s" % (name_keylist, str_keylist)
+            print "%-22s\t%s" % (name_aptitude, str_aptitude)
+            print "%-22s\t%s" % (name_actualize, str_actualize)
+            for title in str_stitle_list:
+                print "%-22s\t%s" % (name_stitle, title)
+
+            print "sunyue test"
+            info_dict.pop("name_buyer", str_buyer)
+            info_dict.pop("name_agent", str_agent)
+            info_dict.pop("name_papertm", str_papertm)
+            info_dict.pop("name_betm", str_betm)
+            info_dict.pop("name_budget", str_budget)
+            info_dict.pop("name_ntype", str_ntype)
+            info_dict.pop("name_aptitude", str_aptitude)
+            info_dict.pop("name_actualize", str_actualize)
+            info_dict.pop("name_stitle", str_stitle_list)
+
+            return info_dict
+
+if __name__ == '__main__':
+    pass
+
